@@ -167,7 +167,7 @@ public class RecognitionService {
         taskMapper.insert(task);
 
         try {
-            JsonNode response = pythonClient.inferenceImage(savedPath, ocr);
+            JsonNode response = pythonClient.inferenceImageByMinio(savedPath, ocr);
             JsonNode data = response.get("data");
 
             task.setStatus("SUCCESS");
@@ -177,23 +177,9 @@ public class RecognitionService {
 
             log.info("图片同步识别完成: taskId={}, plates={}", taskId, data.get("plates"));
             RecognitionResultVO vo = toVO(task);
-            // 标注图上传 MinIO，前端直连
-            if (data.has("annotated_url") && !data.get("annotated_url").isNull()) {
-                String flaskPath = data.get("annotated_url").asText();
-                String filename = flaskPath.substring(flaskPath.lastIndexOf('/') + 1);
-                try {
-                    java.io.File annotatedFile = new java.io.File(
-                        "C:/Users/张开兴/Desktop/车牌识别/inference/uploads", filename);
-                    if (annotatedFile.exists()) {
-                        String minioName = "images/" + task.getTaskId() + "_annotated.jpg";
-                        minioService.uploadFromFile(annotatedFile, minioName);
-                        vo.setAnnotatedImageUrl(minioService.getUrl(minioName));
-                    }
-                } catch (Exception ignored) {}
-            }
-            if (data.has("image_url") && !data.get("image_url").isNull()) {
-                vo.setImageUrl(proxyUrl(data.get("image_url").asText()));
-            }
+            // Python 已直传 MinIO，URL 直接用
+            if (data.has("annotated_url") && !data.get("annotated_url").isNull())
+                vo.setAnnotatedImageUrl(data.get("annotated_url").asText());
             return vo;
 
         } catch (Exception e) {
@@ -219,11 +205,16 @@ public class RecognitionService {
         if ("video".equals(task.getFileType())) {
             // 视频：异步重新处理
             self.processVideoAsync(task);
-            return toVO(task);  // 返回 PROCESSING 状态
+            return toVO(task);
         } else {
-            // 图片：同步重新处理
             try {
-                JsonNode response = pythonClient.inferenceImage(task.getFilePath());
+                String fp = task.getFilePath();
+                JsonNode response;
+                if (fp.startsWith("uploads/")) {
+                    response = pythonClient.inferenceImageByMinio(fp, "lprnet");
+                } else {
+                    response = pythonClient.inferenceImage(fp);  // 旧本地路径
+                }
                 JsonNode data = response.get("data");
                 task.setStatus("SUCCESS");
                 task.setPlatesJson(data.toString());
@@ -242,20 +233,16 @@ public class RecognitionService {
     /** MinIO 直传后，下载并同步识别图片 */
     public RecognitionResultVO processFromMinio(String taskId, String objectName) {
         try {
-            InputStream is = minioService.download(objectName);
-            String savedPath = saveStream(is, taskId, objectName);
-            is.close();
-
             RecognitionTask task = new RecognitionTask();
             task.setTaskId(taskId);
             task.setFileName(objectName.substring(objectName.lastIndexOf('/') + 1));
             task.setFileType("image");
-            task.setFilePath(savedPath);
+            task.setFilePath(objectName);  // 存 MinIO 对象名
             task.setStatus("PROCESSING");
             task.setCreateTime(LocalDateTime.now());
             taskMapper.insert(task);
 
-            JsonNode response = pythonClient.inferenceImage(savedPath);
+            JsonNode response = pythonClient.inferenceImageByMinio(objectName, "lprnet");
             JsonNode data = response.get("data");
             task.setStatus("SUCCESS");
             task.setPlatesJson(data.toString());
@@ -283,36 +270,17 @@ public class RecognitionService {
 
     /** MinIO 直传后，下载并异步处理视频 */
     public String submitFromMinio(String taskId, String objectName) {
-        try {
-            InputStream is = minioService.download(objectName);
-            String savedPath = saveStream(is, taskId, objectName);
-            is.close();
+        RecognitionTask task = new RecognitionTask();
+        task.setTaskId(taskId);
+        task.setFileName(objectName.substring(objectName.lastIndexOf('/') + 1));
+        task.setFileType("video");
+        task.setFilePath(objectName);  // 存 MinIO 对象名
+        task.setStatus("PENDING");
+        task.setCreateTime(LocalDateTime.now());
+        taskMapper.insert(task);
 
-            RecognitionTask task = new RecognitionTask();
-            task.setTaskId(taskId);
-            task.setFileName(objectName.substring(objectName.lastIndexOf('/') + 1));
-            task.setFileType("video");
-            task.setFilePath(savedPath);
-            task.setStatus("PENDING");
-            task.setCreateTime(LocalDateTime.now());
-            taskMapper.insert(task);
-
-            self.processVideoAsync(task);
-            return taskId;
-        } catch (Exception e) {
-            throw new RuntimeException("MinIO 处理失败", e);
-        }
-    }
-
-    private String saveStream(InputStream is, String taskId, String objectName) throws IOException {
-        File dir = new File(uploadPath);
-        if (!dir.isAbsolute()) dir = new File(System.getProperty("user.dir"), uploadPath);
-        if (!dir.exists()) dir.mkdirs();
-        String ext = "";
-        if (objectName.contains(".")) ext = objectName.substring(objectName.lastIndexOf("."));
-        File dest = new File(dir, taskId + ext);
-        java.nio.file.Files.copy(is, dest.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-        return dest.getAbsolutePath();
+        self.processVideoAsync(task);
+        return taskId;
     }
 
     /** 公开文件类型判断，Controller 也需要用 */
@@ -385,9 +353,9 @@ public class RecognitionService {
             task.setStatus("PROCESSING");
             taskMapper.updateById(task);
 
-            // 批处理推理：Python 逐帧检测+画框+合视频
+            // Python 直接从 MinIO 下载原始视频
             long pyStart = System.currentTimeMillis();
-            JsonNode response = pythonClient.inferenceVideo(task.getFilePath(), 1, ocr);
+            JsonNode response = pythonClient.inferenceVideoByMinio(task.getFilePath(), 1, ocr);
             long pyEnd = System.currentTimeMillis();
             log.info("[耗时] Python推理+合成: {}ms", pyEnd - pyStart);
             JsonNode data = response.get("data");
@@ -420,32 +388,6 @@ public class RecognitionService {
             task.setStatus("SUCCESS");
             task.setCompleteTime(LocalDateTime.now());
             taskMapper.updateById(task);
-
-            // 标注视频上传 MinIO，把 MinIO URL 写进 platesJson
-            String minioVideoUrl = null;
-            if (data.has("annotated_video_url") && !data.get("annotated_video_url").isNull()) {
-                String flaskPath = data.get("annotated_video_url").asText();
-                String filename = flaskPath.substring(flaskPath.lastIndexOf('/') + 1);
-                try {
-                    java.io.File annotatedFile = new java.io.File(
-                        "C:/Users/张开兴/Desktop/车牌识别/inference/uploads", filename);
-                    if (annotatedFile.exists()) {
-                        String minioName = "videos/" + task.getTaskId() + "_annotated.mp4";
-                        minioService.uploadFromFile(annotatedFile, minioName);
-                        minioVideoUrl = minioService.getUrl(minioName);
-                    }
-                } catch (Exception ignored) {}
-            }
-            // 把 MinIO URL 追加进 platesJson
-            if (minioVideoUrl != null) {
-                try {
-                    com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
-                    com.fasterxml.jackson.databind.node.ObjectNode json = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(data.toString());
-                    json.put("minio_video_url", minioVideoUrl);
-                    task.setPlatesJson(json.toString());
-                    taskMapper.updateById(task);
-                } catch (Exception ignored) {}
-            }
 
             RecognitionResultVO vo = toVO(task);
             wsHandler.pushResult(task.getTaskId(), vo);
@@ -520,18 +462,11 @@ public class RecognitionService {
                 if (json.has("image_url") && !json.get("image_url").isNull()) {
                     vo.setImageUrl(proxyUrl(json.get("image_url").asText()));
                 }
-                if (json.has("annotated_url") && !json.get("annotated_url").isNull()) {
-                    vo.setAnnotatedImageUrl(proxyUrl(json.get("annotated_url").asText()));
-                }
-                // MinIO URL 优先，降级到 Flask 代理
-                if (json.has("minio_video_url") && !json.get("minio_video_url").isNull()) {
-                    vo.setAnnotatedVideoUrl(json.get("minio_video_url").asText());
-                } else if (json.has("annotated_video_url") && !json.get("annotated_video_url").isNull()) {
-                    vo.setAnnotatedVideoUrl(proxyUrl(json.get("annotated_video_url").asText()));
-                }
-                if (json.has("frame_url_prefix") && !json.get("frame_url_prefix").isNull()) {
-                    vo.setAnnotatedVideoUrl(proxyUrl(json.get("frame_url_prefix").asText()));
-                }
+                // Py 直传 MinIO，URL 直接用
+                if (json.has("annotated_url") && !json.get("annotated_url").isNull())
+                    vo.setAnnotatedImageUrl(json.get("annotated_url").asText());
+                if (json.has("annotated_video_url") && !json.get("annotated_video_url").isNull())
+                    vo.setAnnotatedVideoUrl(json.get("annotated_video_url").asText());
                 if (json.has("video_url") && !json.get("video_url").isNull()) {
                     vo.setVideoUrl(proxyUrl(json.get("video_url").asText()));
                 }
@@ -556,11 +491,8 @@ public class RecognitionService {
      */
     private String proxyUrl(String pythonPath) {
         if (pythonPath == null) return null;
-        // /uploads/xxx_frames/frame_0001.jpg → /api/images/xxx_frames/frame_0001.jpg
         int idx = pythonPath.indexOf("/uploads/");
-        if (idx >= 0) {
-            return "/api/images" + pythonPath.substring(idx + 8); // 8 = "/uploads".length()
-        }
+        if (idx >= 0) return "/api/images" + pythonPath.substring(idx + 8);
         String filename = pythonPath.substring(pythonPath.lastIndexOf('/') + 1);
         return "/api/images/" + filename;
     }
@@ -577,28 +509,17 @@ public class RecognitionService {
     }
 
     private String saveFile(MultipartFile file, String taskId, String originalName) {
-        // 如果是相对路径，基于 user.dir 解析（确保在任何环境下都指向项目目录）
-        File dir = new File(uploadPath);
-        if (!dir.isAbsolute()) {
-            dir = new File(System.getProperty("user.dir"), uploadPath);
-        }
-        if (!dir.exists()) {
-            boolean created = dir.mkdirs();
-            if (!created) {
-                throw new RuntimeException("无法创建上传目录: " + dir.getAbsolutePath());
-            }
-        }
+        // 只存 MinIO，不存本地
         String ext = "";
         if (originalName != null && originalName.contains(".")) {
             ext = originalName.substring(originalName.lastIndexOf("."));
         }
-        String savedName = taskId + ext;
-        File dest = new File(dir, savedName);
+        String minioObj = "uploads/" + taskId + ext;
         try {
-            file.transferTo(dest);
-        } catch (IOException e) {
+            minioService.upload(file, minioObj);
+            return minioObj;
+        } catch (Exception e) {
             throw new RuntimeException("文件保存失败", e);
         }
-        return dest.getAbsolutePath();
     }
 }

@@ -199,7 +199,10 @@ async function submitFile(file) {
 
   try {
     const t0 = performance.now()
-    const res = await uploadFile(file, ocrModel.value)
+    // 直传 MinIO，不走 Java 中转
+    const { uploadUrl, objectName, taskId } = await getUploadUrl(file.name)
+    await uploadToMinio(uploadUrl, file)
+    const res = await notifyUpload(taskId, objectName, file.type.startsWith('video') ? 'video' : 'image')
     console.log(`[前端] 上传耗时: ${(performance.now() - t0).toFixed(0)}ms  OCR=${ocrModel.value}`)
     if (res.code === 200) {
       const resData = res.data

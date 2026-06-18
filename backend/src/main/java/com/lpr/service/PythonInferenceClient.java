@@ -44,28 +44,46 @@ public class PythonInferenceClient {
      * @return Flask 返回的 JSON 字符串
      */
     public JsonNode inferenceImage(String imagePath) {
-        return inferenceImage(imagePath, "lprnet");
+        // 兼容旧本地路径调用
+        String url = pythonUrl + "/inference/image";
+        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+        body.add("file", new FileSystemResource(imagePath));
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+        HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
+        ResponseEntity<String> response = restTemplate.postForEntity(url, requestEntity, String.class);
+        try { return MAPPER.readTree(response.getBody()); }
+        catch (Exception e) { throw new RuntimeException("Python 服务返回异常", e); }
     }
 
-    public JsonNode inferenceImage(String imagePath, String ocr) {
+    public JsonNode inferenceImageByMinio(String minioObject, String ocr) {
         String url = pythonUrl + "/inference/image?ocr=" + ocr;
 
         MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
-        body.add("file", new FileSystemResource(imagePath));
+        body.add("minio_object", minioObject);
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.MULTIPART_FORM_DATA);
         HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
 
-        log.info("调用 Python 图片推理: {}", imagePath);
+        log.info("调用 Python 图片推理: minio={}", minioObject);
         ResponseEntity<String> response = restTemplate.postForEntity(url, requestEntity, String.class);
+        try { return MAPPER.readTree(response.getBody()); }
+        catch (Exception e) { throw new RuntimeException("Python 服务返回异常", e); }
+    }
 
-        try {
-            return MAPPER.readTree(response.getBody());
-        } catch (Exception e) {
-            log.error("解析 Python 返回 JSON 失败", e);
-            throw new RuntimeException("Python 服务返回异常", e);
-        }
+    public JsonNode inferenceVideoByMinio(String minioObject, int interval, String ocr) {
+        String url = pythonUrl + "/inference/video?ocr=" + ocr;
+        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+        body.add("minio_object", minioObject);
+        body.add("frame_interval", String.valueOf(interval));
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+        HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
+        log.info("调用 Python 视频推理: minio={}", minioObject);
+        ResponseEntity<String> response = restTemplate.postForEntity(url, requestEntity, String.class);
+        try { return MAPPER.readTree(response.getBody()); }
+        catch (Exception e) { throw new RuntimeException("Python 服务返回异常", e); }
     }
 
     /**

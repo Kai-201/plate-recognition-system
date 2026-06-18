@@ -24,6 +24,14 @@ ALLOWED_IMAGE = {'.jpg', '.jpeg', '.png', '.bmp', '.gif'}
 ALLOWED_VIDEO = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv'}
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# MinIO 客户端（Python 直接读写 MinIO）
+from minio import Minio as MinioClientPy
+minio_client = MinioClientPy("127.0.0.1:9000", access_key="minioadmin", secret_key="minioadmin", secure=False)
+MINIO_BUCKET = "lpr-files"
+if not minio_client.bucket_exists(MINIO_BUCKET):
+    minio_client.make_bucket(MINIO_BUCKET)
+print("[MinIO] 连接成功")
+
 # 全局变量，启动时赋值
 crnn_model = None
 crnn_device = None
@@ -201,19 +209,24 @@ def inference_image():
     请求: multipart/form-data, 字段名 "file"
     返回: {"success": true, "data": {"plates": [...], "count": N, "boxes": [...], "annotated_path": "..."}}
     """
-    if 'file' not in request.files:
-        return jsonify({"success": False, "error": "缺少文件"}), 400
-
-    file = request.files['file']
-    if file.filename == '' or not allowed_file(file.filename, ALLOWED_IMAGE):
-        return jsonify({"success": False, "error": "不支持的文件格式"}), 400
-
-    # 保存到持久化目录（标注图也保存在同一目录，Java 后端可以访问）
+    # 支持两种方式：multipart 或 MinIO 对象名
     import uuid
-    safe_name = secure_filename(file.filename)
-    saved_name = f"{uuid.uuid4().hex}_{safe_name}"
-    saved_path = os.path.join(UPLOAD_DIR, saved_name)
-    file.save(saved_path)
+    minio_obj = request.form.get('minio_object', '')
+    if minio_obj:
+        safe_name = minio_obj.replace('\\', '/').split('/')[-1]
+        saved_name = f"{uuid.uuid4().hex}_{safe_name}"
+        saved_path = os.path.join(UPLOAD_DIR, saved_name)
+        minio_client.fget_object(MINIO_BUCKET, minio_obj, saved_path)
+    elif 'file' in request.files:
+        file = request.files['file']
+        if file.filename == '' or not allowed_file(file.filename, ALLOWED_IMAGE):
+            return jsonify({"success": False, "error": "不支持的文件格式"}), 400
+        safe_name = secure_filename(file.filename)
+        saved_name = f"{uuid.uuid4().hex}_{safe_name}"
+        saved_path = os.path.join(UPLOAD_DIR, saved_name)
+        file.save(saved_path)
+    else:
+        return jsonify({"success": False, "error": "缺少文件或minio_object"}), 400
 
     try:
         image = cv2.imread(saved_path)
@@ -233,11 +246,18 @@ def inference_image():
         result = {
             "plates": plates, "count": len(plates),
             "boxes": boxes.tolist() if hasattr(boxes, 'tolist') else boxes if len(boxes) > 0 else [],
-            "annotated_path": annotated_path
         }
+        # 上传标注图到 MinIO
         if annotated_path:
-            result["annotated_url"] = f"/uploads/{os.path.basename(annotated_path)}"
-        result["image_url"] = f"/uploads/{saved_name}"
+            img_obj = f"images/{os.path.basename(annotated_path)}"
+            minio_client.fput_object(MINIO_BUCKET, img_obj, annotated_path)
+            result["annotated_url"] = minio_client.presigned_get_object(MINIO_BUCKET, img_obj)
+        # 清理本地文件
+        try: os.remove(saved_path)
+        except: pass
+        if annotated_path:
+            try: os.remove(annotated_path)
+            except: pass
         return jsonify({"success": True, "data": result})
     except Exception as e:
         traceback.print_exc()
@@ -250,18 +270,25 @@ def inference_video():
     视频推理（批处理）：逐帧检测识别 + 画框 + 合成标注 MP4
     返回: {"success": true, "data": {"fps":30, "results":[...], "annotated_video_url":"/uploads/xxx.mp4"}}
     """
-    if 'file' not in request.files:
-        return jsonify({"success": False, "error": "缺少文件"}), 400
-
-    file = request.files['file']
-    if file.filename == '' or not allowed_file(file.filename, ALLOWED_VIDEO):
-        return jsonify({"success": False, "error": "不支持的文件格式"}), 400
-
+    # 支持两种方式：multipart 上传 或 MinIO 对象名
     import uuid
-    safe_name = secure_filename(file.filename)
-    saved_name = f"{uuid.uuid4().hex}_{safe_name}"
-    saved_path = os.path.join(UPLOAD_DIR, saved_name)
-    file.save(saved_path)
+    minio_obj = request.form.get('minio_object', '')
+    if minio_obj:
+        # 从 MinIO 下载（兼容 Windows 路径→提取文件名）
+        safe_name = minio_obj.replace('\\', '/').split('/')[-1]
+        saved_name = f"{uuid.uuid4().hex}_{safe_name}"
+        saved_path = os.path.join(UPLOAD_DIR, saved_name)
+        minio_client.fget_object(MINIO_BUCKET, minio_obj, saved_path)
+    elif 'file' in request.files:
+        file = request.files['file']
+        if file.filename == '' or not allowed_file(file.filename, ALLOWED_VIDEO):
+            return jsonify({"success": False, "error": "不支持的文件格式"}), 400
+        safe_name = secure_filename(file.filename)
+        saved_name = f"{uuid.uuid4().hex}_{safe_name}"
+        saved_path = os.path.join(UPLOAD_DIR, saved_name)
+        file.save(saved_path)
+    else:
+        return jsonify({"success": False, "error": "缺少文件或minio_object"}), 400
 
     try:
         # 打开视频
@@ -345,9 +372,9 @@ def inference_video():
               f"画框{t_draw:.1f}s | 写视频{t_write:.1f}s | "
               f"({frame_idx}帧, 间隔{detect_interval})")
 
-        # ffmpeg 合成：临时视频(画面) + 原视频(音频) → H.264 MP4
-        annotated_video = os.path.join(UPLOAD_DIR,
-            os.path.splitext(saved_name)[0] + "_annotated.mp4")
+        # ffmpeg 合成 → 上传 MinIO
+        annotated_name = os.path.splitext(saved_name)[0] + "_annotated.mp4"
+        annotated_video = os.path.join(UPLOAD_DIR, annotated_name)
         # 自动找 ffmpeg（winget/PATH/手动下载）
         ffmpeg_exe = "ffmpeg"
         for possible in [
@@ -371,10 +398,22 @@ def inference_video():
         if proc.returncode != 0:
             print(f"[FFmpeg] 失败: {proc.stderr[:500]}")
 
+        # 上传标注视频到 MinIO
+        minio_video_obj = f"videos/{annotated_name}"
+        minio_client.fput_object(MINIO_BUCKET, minio_video_obj, annotated_video)
+        minio_video_url = minio_client.presigned_get_object(MINIO_BUCKET, minio_video_obj)
+        # 清理本地文件
+        try: os.remove(saved_path)
+        except: pass
+        try: os.remove(temp_video)
+        except: pass
+        try: os.remove(annotated_video)
+        except: pass
+
         return jsonify({"success": True, "data": {
             "fps": fps, "total_frames": total,
             "results": results,
-            "annotated_video_url": f"/uploads/{os.path.basename(annotated_video)}",
+            "annotated_video_url": minio_video_url,
             "video_url": f"/uploads/{saved_name}"
         }})
     except Exception as e:
