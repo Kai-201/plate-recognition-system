@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find \"D:/ffmpeg-8.1.2\" -name \"ffmpeg.exe\" 2>/dev/null || echo \"没找到exe\")",
+      "Read(//d/ffmpeg-8.1.2/**)"
+    ]
+  }
+}
