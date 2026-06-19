@@ -42,6 +42,10 @@
       <div v-if="result.status === 'PENDING' || result.status === 'PROCESSING'" class="result-status">
         <div class="spinner"></div>
         <p>{{ result.status === 'PENDING' ? '任务排队中...' : streamProgress }}</p>
+        <div v-if="uploadProgress > 0 && uploadProgress < 100" class="progress-bar">
+          <div class="progress-fill" :style="{width: uploadProgress + '%'}"></div>
+          <span>{{ uploadProgress }}%</span>
+        </div>
       </div>
 
       <!-- 成功 -->
@@ -118,6 +122,7 @@ import { uploadFile, getHistory, connectWebSocket, computeFileHash, checkFileHas
 const fileInput = ref(null)
 const dragging = ref(false)
 const currentFile = ref(null)
+const uploadProgress = ref(0)
 const ocrModel = ref('lprnet')
 let videoLoadStart = 0
 let uploadStartTime = 0
@@ -199,10 +204,61 @@ async function submitFile(file) {
 
   try {
     const t0 = performance.now()
-    // 直传 MinIO，不走 Java 中转
+
+    // 小文件等 Hash，大文件上传+Hash 并行
+    const isBig = file.size > 10 * 1024 * 1024
+    const hashPromise = computeFileHash(file)
+    let hash = isBig ? '' : await hashPromise
+
+    // 小文件秒传检查
+    if (!isBig && hash) {
+      const check = await checkFileHash(hash)
+      if (check.code === 200 && check.data) {
+        const cd = check.data
+        // SUCCESS → 秒传，PENDING/PROCESSING → 等结果
+        if (cd.status === 'SUCCESS') {
+          result.value = cd; loadHistory()
+          console.log(`[秒传] ${(performance.now() - t0).toFixed(0)}ms`)
+          return
+        }
+        if (cd.taskId) {
+          console.log(`[秒传-处理中] 复用 taskId: ${cd.taskId}`)
+          setupVideoWait(cd.taskId, t0)
+          return
+        }
+      }
+    }
+
+    // 上传 MinIO（大文件可被 abort 中断，带进度条）
+    uploadProgress.value = 0
     const { uploadUrl, objectName, taskId } = await getUploadUrl(file.name)
-    await uploadToMinio(uploadUrl, file)
-    const res = await notifyUpload(taskId, objectName, file.type.startsWith('video') ? 'video' : 'image')
+    const controller = new AbortController()
+    const uploadPromise = uploadToMinio(uploadUrl, file, (pct) => { uploadProgress.value = pct }, controller.signal)
+
+    // 大文件：Hash 并行跑，命中则中断上传
+    if (isBig) {
+      hash = await hashPromise
+      if (hash) {
+        const check = await checkFileHash(hash)
+        if (check.code === 200 && check.data) {
+          controller.abort()
+          const cd = check.data
+          if (cd.status === 'SUCCESS') {
+            result.value = cd; loadHistory()
+            console.log(`[秒传(大文件)] ${(performance.now() - t0).toFixed(0)}ms`)
+            return
+          }
+          if (cd.taskId) {
+            console.log(`[秒传-处理中(大)] 复用 taskId: ${cd.taskId}`)
+            setupVideoWait(cd.taskId, t0)
+            return
+          }
+        }
+      }
+    }
+
+    await uploadPromise.catch(() => {})  // 被秒传中断则不报错
+    const res = await notifyUpload(taskId, objectName, file.type.startsWith('video') ? 'video' : 'image', hash || '')
     console.log(`[前端] 上传耗时: ${(performance.now() - t0).toFixed(0)}ms  OCR=${ocrModel.value}`)
     if (res.code === 200) {
       const resData = res.data
@@ -213,43 +269,45 @@ async function submitFile(file) {
         result.value = resData
         loadHistory()
       } else if (resData.taskId) {
-        // 视频：WS + 轮询双通道
-        const taskId = resData.taskId
-        result.value = { status: 'PROCESSING', taskId }
-        let done = false
-        const ws = connectWebSocket(taskId, (data) => {
-          if (done) return
-          if (data.status === 'SUCCESS') {
-            result.value = { ...data, taskId }; done = true; ws.close(); loadHistory()
-          } else if (data.status === 'FAILED') {
-            result.value = { ...data, taskId }; done = true; ws.close()
-          }
-        })
-        const pingTimer = setInterval(() => {
-          if (done) { clearInterval(pingTimer); return }
-          if (ws.readyState === WebSocket.OPEN) ws.send('ping')
-        }, 30000)
-        // 轮询兜底，3秒一次
-        let pollCount = 0
-        const pollTimer = setInterval(async () => {
-          pollCount++
-          if (done || pollCount > 200) { clearInterval(pollTimer); return }
-          try {
-            const { getTaskResult } = await import('../api/recognition.js')
-            const pollRes = await getTaskResult(taskId)
-            if (pollRes.code === 200 && pollRes.data &&
-                (pollRes.data.status === 'SUCCESS' || pollRes.data.status === 'FAILED')) {
-              result.value = pollRes.data; done = true
-              clearInterval(pollTimer); try { ws.close() } catch {}
-              if (pollRes.data.status === 'SUCCESS') loadHistory()
-            }
-          } catch {}
-        }, 3000)
+        setupVideoWait(taskId, t0)
       }
     }
   } catch (err) {
+    if (err.name === 'AbortError' || err.name === 'DOMException') return  // 秒传中断上传，不报错
     result.value = { status: 'FAILED', errorMsg: err.message || '上传失败' }
   }
+}
+
+function setupVideoWait(taskId, t0) {
+  result.value = { status: 'PROCESSING', taskId }
+  let done = false
+
+  // SSE 订阅（支持多客户端广播）
+  const es = new EventSource(`/api/recognition/subscribe/${taskId}`)
+  es.addEventListener('result', (e) => {
+    if (done) return
+    const data = JSON.parse(e.data)
+    if (data.status === 'SUCCESS') {
+      result.value = { ...data, taskId }; done = true; es.close(); loadHistory()
+      console.log(`[SSE-完成] ${(performance.now() - t0).toFixed(0)}ms`)
+    } else if (data.status === 'FAILED') {
+      result.value = { ...data, taskId }; done = true; es.close()
+    }
+  })
+
+  // 轮询兜底
+  const pollTimer = setInterval(async () => {
+    if (done) { clearInterval(pollTimer); return }
+    try {
+      const { getTaskResult } = await import('../api/recognition.js')
+      const r = await getTaskResult(taskId)
+      if (r.code === 200 && r.data && (r.data.status === 'SUCCESS' || r.data.status === 'FAILED')) {
+        result.value = r.data; done = true
+        clearInterval(pollTimer); try { es.close() } catch {}
+        if (r.data.status === 'SUCCESS') loadHistory()
+      }
+    } catch {}
+  }, 3000)
 }
 
 async function loadHistory() {
@@ -273,17 +331,7 @@ async function handleRetry(item) {
   currentFile.value = { name: item.fileName, size: 0 }
 
   if (item.fileType === 'video') {
-    result.value = { status: 'PROCESSING', taskId: item.taskId }
-    let done = false
-    const ws = connectWebSocket(item.taskId, (data) => {
-      if (done) return
-      if (data.status === 'SUCCESS') { result.value = { ...data, taskId: item.taskId }; done = true; ws.close(); loadHistory() }
-      else if (data.status === 'FAILED') { result.value = { ...data, taskId: item.taskId }; done = true; ws.close() }
-    })
-    const pingTimer = setInterval(() => {
-      if (done) { clearInterval(pingTimer); return }
-      if (ws.readyState === WebSocket.OPEN) ws.send('ping')
-    }, 30000)
+    setupVideoWait(item.taskId, performance.now())
 
     // WS 建好后再调重试
     ws.onopen = async () => {
@@ -350,6 +398,18 @@ onMounted(() => {
 .upload-icon { font-size: 48px; margin-bottom: 12px; }
 .upload-hint p { font-size: 16px; color: #333; margin-bottom: 4px; }
 .upload-sub { font-size: 12px; color: #999; }
+
+.progress-bar {
+  width: 200px; height: 20px; background: #e0e0e0; border-radius: 10px;
+  margin: 8px auto 0; overflow: hidden; position: relative;
+}
+.progress-fill {
+  height: 100%; background: #1a73e8; border-radius: 10px; transition: width 0.2s;
+}
+.progress-bar span {
+  position: absolute; top: 0; left: 0; width: 100%; text-align: center;
+  font-size: 12px; color: #333; line-height: 20px;
+}
 
 .spinner {
   width: 36px; height: 36px;

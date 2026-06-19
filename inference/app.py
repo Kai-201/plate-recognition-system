@@ -291,22 +291,18 @@ def inference_video():
         return jsonify({"success": False, "error": "缺少文件或minio_object"}), 400
 
     try:
-        # 打开视频
         cap = cv2.VideoCapture(saved_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        # 检测间隔：每 N 帧跑一次 YOLO+LPRNet，中间帧复用上一次结果
         detect_interval = int(request.form.get('frame_interval', 1))
+        ocr_model = request.args.get('ocr', 'lprnet')
 
         import time
         t_start = time.time()
 
-        # 临时无音频标注视频
-        temp_video = os.path.join(UPLOAD_DIR,
-            os.path.splitext(saved_name)[0] + "_temp.mp4")
+        temp_video = os.path.join(UPLOAD_DIR, os.path.splitext(saved_name)[0] + "_temp.mp4")
         writer = cv2.VideoWriter(temp_video, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
 
         results = []
@@ -319,23 +315,18 @@ def inference_video():
             t0 = time.time()
             ret, frame = cap.read()
             t_read += time.time() - t0
-            if not ret:
-                break
+            if not ret: break
             fr = {"frame": frame_idx, "plates": [], "boxes": []}
 
             if frame_idx % detect_interval == 0:
                 detect_count += 1
                 t0 = time.time()
-
-                # 每10帧走一次全量保底，其余帧只直接检测
-
-                run_fb = True  # 每帧都走：直接检测 → 找不到就保底
-                boxes, crops, car_boxes = detect_plates_with_fallback(frame, run_fallback=run_fb)
+                boxes, crops, car_boxes = detect_plates_with_fallback(frame, run_fallback=True)
                 t_detect += time.time() - t0
                 if len(boxes) > 0:
                     total_boxes += 1
                     t0 = time.time()
-                    plates = ocr_recognize(crops, request.args.get('ocr', 'lprnet'))
+                    plates = ocr_recognize(crops, ocr_model)
                     t_recognize += time.time() - t0
                     fr["plates"] = plates
                     fr["boxes"] = boxes.tolist() if hasattr(boxes, 'tolist') else boxes
@@ -349,10 +340,9 @@ def inference_video():
                 fr["boxes"] = last_boxes
                 t0 = time.time()
                 frame = engine._draw_on_frame(frame,
-                    [list(map(float, b)) for b in last_boxes], last_plates)
+                    np.array([list(map(float, b)) for b in last_boxes]), last_plates)
                 t_draw += time.time() - t0
 
-            # 画车辆检测框（蓝色，保底时有）
             if frame_idx % detect_interval == 0:
                 for cb in car_boxes:
                     cv2.rectangle(frame, tuple(map(int, cb[:2])), tuple(map(int, cb[2:])), (255, 0, 0), 1)
@@ -366,8 +356,7 @@ def inference_video():
         cap.release()
         writer.release()
         t_total = time.time() - t_start
-        ocr_engine = request.args.get('ocr', 'lprnet')
-        print(f"[耗时明细][{ocr_engine}] 总{t_total:.1f}s | 读帧{t_read:.1f}s | "
+        print(f"[耗时明细][{ocr_model}] 总{t_total:.1f}s | 读帧{t_read:.1f}s | "
               f"检测({detect_count}次){t_detect:.1f}s | 识别({total_boxes}次){t_recognize:.1f}s | "
               f"画框{t_draw:.1f}s | 写视频{t_write:.1f}s | "
               f"({frame_idx}帧, 间隔{detect_interval})")

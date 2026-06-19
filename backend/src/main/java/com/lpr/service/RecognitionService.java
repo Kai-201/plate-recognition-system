@@ -1,6 +1,7 @@
 package com.lpr.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.lpr.mapper.RecognitionTaskMapper;
 import com.lpr.model.RecognitionResultVO;
@@ -56,6 +57,9 @@ public class RecognitionService {
     private RecognitionWebSocketHandler wsHandler;
 
     @Resource
+    private com.lpr.config.SseService sseService;
+
+    @Resource
     private MinioService minioService;
 
     @org.springframework.context.annotation.Lazy
@@ -67,6 +71,13 @@ public class RecognitionService {
 
     // ==================== 秒传检查 ====================
 
+    public void updateHash(String taskId, String hash) {
+        if (hash == null || hash.isEmpty()) return;
+        taskMapper.update(null, new LambdaUpdateWrapper<RecognitionTask>()
+            .eq(RecognitionTask::getTaskId, taskId)
+            .set(RecognitionTask::getFileHash, hash));
+    }
+
     /**
      * 根据文件 MD5 检查是否已有识别记录（秒传）
      * 如果已存在 → 返回历史结果
@@ -74,25 +85,40 @@ public class RecognitionService {
      */
     public RecognitionResultVO checkByHash(String fileHash) {
         if (fileHash == null || fileHash.isEmpty()) return null;
+        // 先查 SUCCESS → 秒传
         RecognitionTask existing = taskMapper.selectOne(
                 new LambdaQueryWrapper<RecognitionTask>()
                         .eq(RecognitionTask::getFileHash, fileHash)
                         .eq(RecognitionTask::getStatus, "SUCCESS")
                         .orderByDesc(RecognitionTask::getCreateTime)
                         .last("LIMIT 1"));
-        return existing != null ? toVO(existing) : null;
+        if (existing != null) return toVO(existing);
+        // 再查 PENDING/PROCESSING → 有人在处理了，返回 taskId 让前端一起等
+        RecognitionTask pending = taskMapper.selectOne(
+                new LambdaQueryWrapper<RecognitionTask>()
+                        .eq(RecognitionTask::getFileHash, fileHash)
+                        .in(RecognitionTask::getStatus, "PENDING", "PROCESSING")
+                        .orderByDesc(RecognitionTask::getCreateTime)
+                        .last("LIMIT 1"));
+        if (pending != null) return toVO(pending);  // status 还是 PROCESSING，前端会继续轮询
+        return null;
     }
 
-    /**
-     * 计算文件 MD5
-     */
+    /** 采样 SHA-256：头1MB+尾1MB+文件大小（与前端的 Web Worker 一致） */
     public String computeHash(InputStream inputStream) {
         try {
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192]; int n;
+            while ((n = inputStream.read(buf)) != -1) baos.write(buf, 0, n);
+            byte[] data = baos.toByteArray();
             MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = inputStream.read(buffer)) != -1) {
-                md.update(buffer, 0, read);
+            int SAMPLE = 1024 * 1024;
+            if (data.length <= SAMPLE * 2) {
+                md.update(data);
+            } else {
+                md.update(data, 0, SAMPLE);
+                md.update(data, data.length - SAMPLE, SAMPLE);
+                md.update(String.valueOf(data.length).getBytes());
             }
             byte[] digest = md.digest();
             StringBuilder sb = new StringBuilder();
@@ -231,16 +257,36 @@ public class RecognitionService {
     }
 
     /** MinIO 直传后，下载并同步识别图片 */
-    public RecognitionResultVO processFromMinio(String taskId, String objectName) {
+    public RecognitionResultVO processFromMinio(String taskId, String objectName, String hash) {
         try {
+            // 并发查重
+            if (hash != null && !hash.isEmpty()) {
+                RecognitionTask dup = taskMapper.selectOne(new LambdaQueryWrapper<RecognitionTask>()
+                    .eq(RecognitionTask::getFileHash, hash)
+                    .in(RecognitionTask::getStatus, "PENDING", "PROCESSING")
+                    .last("LIMIT 1"));
+                if (dup != null) {
+                    log.info("并发去重(图片): 复用 taskId={}", dup.getTaskId());
+                    return toVO(dup);
+                }
+            }
+
             RecognitionTask task = new RecognitionTask();
             task.setTaskId(taskId);
             task.setFileName(objectName.substring(objectName.lastIndexOf('/') + 1));
             task.setFileType("image");
-            task.setFilePath(objectName);  // 存 MinIO 对象名
+            task.setFilePath(objectName);
+            if (hash != null && !hash.isEmpty()) task.setFileHash(hash);  // 存 MinIO 对象名
             task.setStatus("PROCESSING");
             task.setCreateTime(LocalDateTime.now());
-            taskMapper.insert(task);
+            try {
+                taskMapper.insert(task);
+            } catch (org.springframework.dao.DuplicateKeyException e) {
+                RecognitionTask dup = taskMapper.selectOne(new LambdaQueryWrapper<RecognitionTask>()
+                    .eq(RecognitionTask::getFileHash, hash).last("LIMIT 1"));
+                if (dup != null) { log.info("唯一索引去重(图片): 复用 taskId={}", dup.getTaskId()); return toVO(dup); }
+                throw e;
+            }
 
             JsonNode response = pythonClient.inferenceImageByMinio(objectName, "lprnet");
             JsonNode data = response.get("data");
@@ -269,15 +315,40 @@ public class RecognitionService {
     }
 
     /** MinIO 直传后，下载并异步处理视频 */
-    public String submitFromMinio(String taskId, String objectName) {
+    public String submitFromMinio(String taskId, String objectName, String hash) {
+        // 并发查重：有人先插了带同样 hash 的记录 → 返回那个 taskId
+        if (hash != null && !hash.isEmpty()) {
+            RecognitionTask dup = taskMapper.selectOne(new LambdaQueryWrapper<RecognitionTask>()
+                .eq(RecognitionTask::getFileHash, hash)
+                .in(RecognitionTask::getStatus, "PENDING", "PROCESSING")
+                .last("LIMIT 1"));
+            if (dup != null) {
+                log.info("并发去重: 复用 taskId={}", dup.getTaskId());
+                return dup.getTaskId();
+            }
+        }
+
         RecognitionTask task = new RecognitionTask();
         task.setTaskId(taskId);
         task.setFileName(objectName.substring(objectName.lastIndexOf('/') + 1));
         task.setFileType("video");
-        task.setFilePath(objectName);  // 存 MinIO 对象名
+        task.setFilePath(objectName);
+        if (hash != null && !hash.isEmpty()) task.setFileHash(hash);
         task.setStatus("PENDING");
         task.setCreateTime(LocalDateTime.now());
-        taskMapper.insert(task);
+        try {
+            taskMapper.insert(task);
+        } catch (org.springframework.dao.DuplicateKeyException e) {
+            // 唯一索引冲突 → 有人抢先插了，返回那条记录
+            RecognitionTask dup = taskMapper.selectOne(new LambdaQueryWrapper<RecognitionTask>()
+                .eq(RecognitionTask::getFileHash, hash)
+                .last("LIMIT 1"));
+            if (dup != null) {
+                log.info("唯一索引去重: 复用 taskId={}", dup.getTaskId());
+                return dup.getTaskId();
+            }
+            throw e;
+        }
 
         self.processVideoAsync(task);
         return taskId;
@@ -390,7 +461,8 @@ public class RecognitionService {
             taskMapper.updateById(task);
 
             RecognitionResultVO vo = toVO(task);
-            wsHandler.pushResult(task.getTaskId(), vo);
+            sseService.push(task.getTaskId(), vo);
+            log.info("SSE已推送: taskId={}", task.getTaskId());
             long totalTime = java.time.Duration.between(task.getCreateTime(), LocalDateTime.now()).toMillis();
             log.info("[总耗时] 视频上传到结果就绪: {}ms ({}s)", totalTime, totalTime / 1000);
             log.info("视频识别完成: taskId={}, platesJson已存储", task.getTaskId());
@@ -509,7 +581,6 @@ public class RecognitionService {
     }
 
     private String saveFile(MultipartFile file, String taskId, String originalName) {
-        // 只存 MinIO，不存本地
         String ext = "";
         if (originalName != null && originalName.contains(".")) {
             ext = originalName.substring(originalName.lastIndexOf("."));

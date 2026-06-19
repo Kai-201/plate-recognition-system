@@ -1,11 +1,14 @@
 package com.lpr.controller;
 
+import com.lpr.config.SseService;
 import com.lpr.model.RecognitionResultVO;
 import com.lpr.service.RecognitionService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
@@ -36,8 +39,28 @@ public class RecognitionController {
     @Resource
     private RecognitionService recognitionService;
 
+    @Resource
+    private SseService sseService;
+
     /**
-     * 秒传检查：根据文件 MD5 查询是否已有识别结果
+     * SSE 订阅（替代 WebSocket，支持多客户端广播）
+     */
+    @GetMapping(value = "/subscribe/{taskId}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter subscribe(@PathVariable String taskId) {
+        return sseService.subscribe(taskId);
+    }
+
+    /**
+     * 大文件后台算完 Hash 后异步更新
+     */
+    @PostMapping("/hash")
+    public ResponseEntity<Map<String, Object>> updateHash(@RequestBody Map<String, String> body) {
+        recognitionService.updateHash(body.get("taskId"), body.get("hash"));
+        return ResponseEntity.ok(success("ok", null));
+    }
+
+    /**
+     * 秒传检查：根据文件 SHA-256 查询是否已有识别结果
      */
     @GetMapping("/check")
     public ResponseEntity<Map<String, Object>> check(@RequestParam String hash) {
@@ -60,13 +83,14 @@ public class RecognitionController {
         String taskId = body.get("taskId");
         String objectName = body.get("objectName");
         String fileType = body.get("fileType");
-        log.info("MinIO 直传完成: taskId={}, object={}", taskId, objectName);
+        String hash = body.getOrDefault("hash", "");
+        log.info("MinIO 直传完成: taskId={}, object={}, hash={}", taskId, objectName, hash);
         try {
             if ("image".equals(fileType)) {
-                RecognitionResultVO result = recognitionService.processFromMinio(taskId, objectName);
+                RecognitionResultVO result = recognitionService.processFromMinio(taskId, objectName, hash);
                 return ResponseEntity.ok(success("识别完成", result));
             } else {
-                String tid = recognitionService.submitFromMinio(taskId, objectName);
+                String tid = recognitionService.submitFromMinio(taskId, objectName, hash);
                 Map<String, Object> data = new HashMap<>();
                 data.put("taskId", tid);
                 return ResponseEntity.ok(success("任务已创建", data));

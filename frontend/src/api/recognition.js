@@ -10,37 +10,51 @@ export function getUploadUrl(fileName) {
 }
 
 /**
- * 直接上传文件到 MinIO（前端直传，不走 Java）
- * 不发额外 header，只发纯文件体，避免签名校验失败
+ * 上传到 MinIO（XHR, 带进度, 支持 AbortController 取消）
  */
-export function uploadToMinio(uploadUrl, file) {
-  return fetch(uploadUrl, {
-    method: 'PUT',
-    body: file
+export function uploadToMinio(uploadUrl, file, onProgress, signal) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('PUT', uploadUrl)
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(Math.round(e.loaded / e.total * 100))
+      }
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response)
+      else reject(new Error(`Upload failed: ${xhr.status}`))
+    }
+    xhr.onerror = () => reject(new Error('Network error'))
+    if (signal) {
+      signal.addEventListener('abort', () => { xhr.abort(); reject(new DOMException('Aborted', 'AbortError')) })
+    }
+    xhr.send(file)
   })
 }
 
 /**
  * 通知 Java 文件已上传到 MinIO，开始推理
  */
-export function notifyUpload(taskId, objectName, fileType) {
-  return axios.post(`${API_BASE}/notify`, { taskId, objectName, fileType }).then(res => res.data)
+export function notifyUpload(taskId, objectName, fileType, hash = '') {
+  return axios.post(`${API_BASE}/notify`, { taskId, objectName, fileType, hash }).then(res => res.data)
 }
 
 /**
- * 计算文件 SHA-256（秒传用）
+ * 计算文件 SHA-256（Web Worker，不卡页面）
  */
 export function computeFileHash(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = async (e) => {
-      const buffer = e.target.result
-      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer)
-      const hashArray = Array.from(new Uint8Array(hashBuffer))
-      resolve(hashArray.map(b => b.toString(16).padStart(2, '0')).join(''))
+  return new Promise((resolve) => {
+    const worker = new Worker('/hash.worker.js')
+    worker.onmessage = (e) => {
+      if (e.data.error) console.warn('[Hash] Worker 错误:', e.data.error)
+      resolve(e.data.hash)
     }
-    reader.onerror = reject
-    reader.readAsArrayBuffer(file)
+    worker.onerror = (e) => {
+      console.warn('[Hash] Worker 启动失败:', e)
+      resolve(null)
+    }
+    worker.postMessage(file)
   })
 }
 
@@ -49,6 +63,13 @@ export function computeFileHash(file) {
  */
 export function retryTask(taskId) {
   return axios.post(`${API_BASE}/retry/${taskId}`).then(res => res.data)
+}
+
+/**
+ * 大文件后台算完 Hash 后异步更新
+ */
+export function notifyHash(taskId, hash) {
+  return axios.post(`${API_BASE}/hash`, { taskId, hash }).catch(() => {})
 }
 
 /**
