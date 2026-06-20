@@ -228,8 +228,6 @@ public class RecognitionService {
         RecognitionTask task = taskMapper.selectOne(
                 new LambdaQueryWrapper<RecognitionTask>().eq(RecognitionTask::getTaskId, taskId));
         if (task == null) return null;
-        File file = new File(task.getFilePath());
-        if (!file.exists()) return null;
 
         if ("video".equals(task.getFileType())) {
             // 视频：异步重新处理
@@ -237,13 +235,7 @@ public class RecognitionService {
             return toVO(task);
         } else {
             try {
-                String fp = task.getFilePath();
-                JsonNode response;
-                if (fp.startsWith("uploads/")) {
-                    response = pythonClient.inferenceImageByMinio(fp, "lprnet");
-                } else {
-                    response = pythonClient.inferenceImage(fp);  // 旧本地路径
-                }
+                JsonNode response = pythonClient.inferenceImageByMinio(task.getFilePath(), "lprnet");
                 JsonNode data = response.get("data");
                 task.setStatus("SUCCESS");
                 task.setPlatesJson(data.toString());
@@ -261,6 +253,7 @@ public class RecognitionService {
 
     /** MinIO 直传后，下载并同步识别图片 */
     public RecognitionResultVO processFromMinio(String taskId, String objectName, String hash) {
+        RecognitionTask task = null;
         try {
             // 并发查重
             if (hash != null && !hash.isEmpty()) {
@@ -274,7 +267,7 @@ public class RecognitionService {
                 }
             }
 
-            RecognitionTask task = new RecognitionTask();
+            task = new RecognitionTask();
             task.setTaskId(taskId);
             task.setFileName(objectName.substring(objectName.lastIndexOf('/') + 1));
             task.setFileType("image");
@@ -313,12 +306,15 @@ public class RecognitionService {
             }
             return vo;
         } catch (Exception e) {
-            throw new RuntimeException("MinIO 处理失败", e);
+            task.setStatus("FAILED"); task.setErrorMsg(e.getMessage());
+            task.setCompleteTime(LocalDateTime.now());
+            taskMapper.updateById(task);
+            return toVO(task);
         }
     }
 
     /** MinIO 直传后，下载并异步处理视频 */
-    public String submitFromMinio(String taskId, String objectName, String hash) {
+    public String submitFromMinio(String taskId, String objectName, String hash, String fileType) {
         // 并发查重：有人先插了带同样 hash 的记录 → 返回那个 taskId
         if (hash != null && !hash.isEmpty()) {
             RecognitionTask dup = taskMapper.selectOne(new LambdaQueryWrapper<RecognitionTask>()
@@ -334,7 +330,7 @@ public class RecognitionService {
         RecognitionTask task = new RecognitionTask();
         task.setTaskId(taskId);
         task.setFileName(objectName.substring(objectName.lastIndexOf('/') + 1));
-        task.setFileType("video");
+        task.setFileType(fileType);
         task.setFilePath(objectName);
         if (hash != null && !hash.isEmpty()) task.setFileHash(hash);
         task.setStatus("PENDING");
@@ -386,7 +382,7 @@ public class RecognitionService {
             taskMapper.updateById(task);
 
             // 调 Python 推理
-            JsonNode response = pythonClient.inferenceImage(task.getFilePath());
+            JsonNode response = pythonClient.inferenceImageByMinio(task.getFilePath(), "lprnet");
             JsonNode data = response.get("data");
 
             // 更新状态：成功
@@ -431,6 +427,7 @@ public class RecognitionService {
             Map<String, Object> mqTask = new HashMap<>();
             mqTask.put("taskId", task.getTaskId());
             mqTask.put("minioObject", task.getFilePath());
+            mqTask.put("type", task.getFileType());  // image / video
             mqTask.put("ocr", ocr);
             mqTask.put("frameInterval", 1);
             mqService.sendTask(mqTask);

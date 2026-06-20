@@ -96,11 +96,10 @@ def start_mq_consumer():
                 params = pika.ConnectionParameters(
                     host=MQ_HOST, port=MQ_PORT, virtual_host=MQ_VHOST,
                     credentials=pika.PlainCredentials(MQ_USER, MQ_PASS),
-                    heartbeat=600, blocked_connection_timeout=300)
+                    heartbeat=30, blocked_connection_timeout=60)
                 conn = pika.BlockingConnection(params)
                 ch = conn.channel()
-                ch.queue_declare(queue=TASK_QUEUE, durable=True)
-                ch.queue_declare(queue=RESULT_QUEUE, durable=True)
+                ch.queue_declare(queue=RESULT_QUEUE, durable=True)  # py→java 结果队列
                 ch.basic_qos(prefetch_count=1)
                 ch.basic_consume(queue=TASK_QUEUE, on_message_callback=on_task)
                 print("[MQ] 视频推理消费者已启动")
@@ -111,18 +110,65 @@ def start_mq_consumer():
                 _time.sleep(5)
 
     def on_task(ch, method, properties, body):
+        # 指数退避重试：5s → 15s → 45s，最多3次
+        headers = properties.headers or {}
+        retry = headers.get('x-retry-count', 0)
+        if method.redelivered and retry >= 3:
+            task_raw = json.loads(body)
+            tid = task_raw.get("taskId", "?")
+            err = {"taskId": tid, "status": "FAILED", "error": f"重试{retry}次仍失败"}
+            ch.basic_publish(exchange='', routing_key=RESULT_QUEUE,
+                             body=json.dumps(err), properties=pika.BasicProperties(delivery_mode=2))
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            print(f"[MQ] FAILED(放弃): {tid}")
+            return
+
         task = json.loads(body)
         task_id = task["taskId"]
         minio_obj = task["minioObject"]
+        task_type = task.get("type", "video")
         ocr = task.get("ocr", "lprnet")
         frame_interval = task.get("frameInterval", 1)
-        print(f"\n[MQ] 收到任务: {task_id}")
+        print(f"\n[MQ] 收到任务: {task_id} ({task_type})")
 
         try:
-            # 下载 → 推理 → ffmpeg → 上传 MinIO
-            local_path = os.path.join(UPLOAD_DIR, f"{task_id}.mp4")
+            ext = minio_obj[minio_obj.rfind('.'):]
+            local_path = os.path.join(UPLOAD_DIR, f"{task_id}{ext}")
             minio_client.fget_object(MINIO_BUCKET, minio_obj, local_path)
 
+            if task_type == "image":
+                import time as _t
+                _t0 = _t.time()
+                image = cv2.imread(local_path)
+                boxes, crops, _ = detect_plates_with_fallback(image, run_fallback=True)
+                plates = ocr_recognize(crops, ocr) if len(boxes) > 0 else []
+                if len(boxes) > 0:
+                    annotated = engine.draw_boxes(local_path, boxes, plates)
+                    if annotated:
+                        img_obj = f"images/{task_id}_annotated{ext}"
+                        minio_client.fput_object(MINIO_BUCKET, img_obj, annotated)
+                        annotated_url = minio_client.presigned_get_object(MINIO_BUCKET, img_obj)
+                        try: os.remove(annotated)
+                        except: pass
+                    else:
+                        annotated_url = ""
+                else:
+                    annotated_url = ""
+                print(f"[MQ] 图片完成: {task_id} {plates} 耗时{_t.time()-_t0:.1f}s")
+
+                result = {"taskId": task_id, "status": "SUCCESS",
+                          "annotatedImageUrl": annotated_url,
+                          "plates": plates}
+                ch.basic_publish(exchange='', routing_key=RESULT_QUEUE,
+                                 body=json.dumps(result, default=str),
+                                 properties=pika.BasicProperties(delivery_mode=2))
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                print(f"[MQ] ACK-Consumer: {task_id}")
+                try: os.remove(local_path)
+                except: pass
+                return
+
+            # ===== 视频处理 =====
             cap = cv2.VideoCapture(local_path)
             fps = cap.get(cv2.CAP_PROP_FPS)
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -180,8 +226,8 @@ def start_mq_consumer():
             ch.basic_publish(exchange='', routing_key=RESULT_QUEUE,
                              body=json.dumps(result, default=str),
                              properties=pika.BasicProperties(delivery_mode=2))
-            print(f"[MQ] 结果已发送: {task_id}")
-            ch.basic_ack(delivery_tag=method.delivery_tag)  # 成功才确认
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            print(f"[MQ] ACK-Consumer: {task_id}")
 
             for f in [local_path, temp_video, annotated_path]:
                 try: os.remove(f)
@@ -189,11 +235,23 @@ def start_mq_consumer():
 
         except Exception as e:
             traceback.print_exc()
-            err = {"taskId": task_id, "status": "FAILED", "error": str(e)}
-            ch.basic_publish(exchange='', routing_key=RESULT_QUEUE,
-                             body=json.dumps(err),
-                             properties=pika.BasicProperties(delivery_mode=2))
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)  # 失败不重回队列，避免死循环
+            next_retry = retry + 1
+            if next_retry <= 3:
+                delays = [5, 15, 45]
+                delay = delays[min(next_retry - 1, 2)]
+                print(f"[MQ] 失败, {delay}s后第{next_retry}次重试: {task_id}")
+                ch.basic_ack(delivery_tag=method.delivery_tag)  # ACK原消息
+                import time as _t2; _t2.sleep(delay)
+                ch.basic_publish(exchange='', routing_key=TASK_QUEUE,
+                                 body=body,
+                                 properties=pika.BasicProperties(headers={'x-retry-count': next_retry}, delivery_mode=2))
+            else:
+                # 超限 → NACK进死信队列(DLQ)
+                err = {"taskId": task_id, "status": "FAILED", "error": str(e), "dlq": True}
+                ch.basic_publish(exchange='', routing_key=RESULT_QUEUE,
+                                 body=json.dumps(err), properties=pika.BasicProperties(delivery_mode=2))
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                print(f"[MQ] ->DLQ: {task_id} 重试{retry}次仍失败")  # 失败不重回队列，避免死循环
 
     consumer_loop()
 

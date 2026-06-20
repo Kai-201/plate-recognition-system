@@ -40,6 +40,9 @@ public class RecognitionController {
     private RecognitionService recognitionService;
 
     @Resource
+    private com.lpr.service.PythonInferenceClient pythonClient;
+
+    @Resource
     private SseService sseService;
 
     /**
@@ -78,6 +81,25 @@ public class RecognitionController {
     /**
      * MinIO 直传完成后通知 Java 开始推理
      */
+    @GetMapping("/py-status")
+    public ResponseEntity<Map<String, Object>> pyStatus() {
+        boolean alive = pyAlive();
+        Map<String, Object> result = new HashMap<>();
+        result.put("alive", alive);
+        return ResponseEntity.ok(success(alive ? "ok" : "down", result));
+    }
+
+    private boolean pyAlive() {
+        try { return pythonClient.healthCheck(); } catch (Exception e) { return false; }
+    }
+
+    private Map<String, Object> pyDownError() {
+        Map<String, Object> err = new HashMap<>();
+        err.put("code", 503); err.put("message", "推理服务(Python Flask)未启动");
+        err.put("data", null);
+        return err;
+    }
+
     @PostMapping("/notify")
     public ResponseEntity<Map<String, Object>> notify(@RequestBody Map<String, String> body) {
         String taskId = body.get("taskId");
@@ -86,15 +108,12 @@ public class RecognitionController {
         String hash = body.getOrDefault("hash", "");
         log.info("MinIO 直传完成: taskId={}, object={}, hash={}", taskId, objectName, hash);
         try {
-            if ("image".equals(fileType)) {
-                RecognitionResultVO result = recognitionService.processFromMinio(taskId, objectName, hash);
-                return ResponseEntity.ok(success("识别完成", result));
-            } else {
-                String tid = recognitionService.submitFromMinio(taskId, objectName, hash);
-                Map<String, Object> data = new HashMap<>();
-                data.put("taskId", tid);
-                return ResponseEntity.ok(success("任务已创建", data));
-            }
+            // 图片和视频统一走 MQ 异步
+            String tid = recognitionService.submitFromMinio(taskId, objectName, hash, fileType);
+            Map<String, Object> data = new HashMap<>();
+            data.put("taskId", tid);
+            if ("image".equals(fileType)) data.put("fileType", "image");
+            return ResponseEntity.ok(success("任务已创建", data));
         } catch (Exception e) {
             return ResponseEntity.internalServerError().body(error(e.getMessage()));
         }
@@ -109,9 +128,7 @@ public class RecognitionController {
     @PostMapping("/upload")
     public ResponseEntity<Map<String, Object>> upload(@RequestParam("file") MultipartFile file,
                                                        @RequestParam(value = "ocr", defaultValue = "lprnet") String ocr) {
-        if (file.isEmpty()) {
-            return ResponseEntity.badRequest().body(error("文件为空"));
-        }
+        if (file.isEmpty()) return ResponseEntity.badRequest().body(error("文件为空"));
 
         long t0 = System.currentTimeMillis();
         log.info("收到上传请求: fileName={}, size={}", file.getOriginalFilename(), file.getSize());
@@ -120,9 +137,10 @@ public class RecognitionController {
             String fileType = recognitionService.getFileTypeText(file.getOriginalFilename());
 
             if ("image".equals(fileType)) {
-                RecognitionResultVO result = recognitionService.processImageSync(file, ocr);
-                log.info("[总耗时] 图片上传到返回结果: {}ms  OCR={}", System.currentTimeMillis() - t0, ocr);
-                return ResponseEntity.ok(success("识别完成", result));
+                String taskId = recognitionService.submitTask(file, ocr);
+                Map<String, Object> data = new HashMap<>();
+                data.put("taskId", taskId);
+                return ResponseEntity.ok(success("任务已创建", data));
             } else {
                 // 视频：异步处理，返回 taskId
                 String taskId = recognitionService.submitTask(file, ocr);
