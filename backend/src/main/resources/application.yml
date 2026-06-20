@@ -12,11 +12,25 @@ spring:
     url: jdbc:mysql://localhost:3306/lpr_db?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
     username: root
     password: 9464.zkx
+  rabbitmq:
+    host: dog-01.lmq.cloudamqp.com
+    port: 5672
+    username: pusvskws
+    password: r-2Rb9_m8n0nt-nrW6DYDwufRCN2AC1r
+    virtual-host: pusvskws
+    publisher-confirm-type: correlated
 
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true
     log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+logging:
+  level:
+    com.zaxxer.hikari: WARN
+    org.mybatis.spring: WARN
+    org.springframework.jdbc: WARN
+    org.apache.ibatis: WARN
   global-config:
     db-config:
       id-type: auto

@@ -6,6 +6,7 @@ import sys
 import traceback
 import cv2
 import numpy as np
+import threading
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 import json
 from werkzeug.utils import secure_filename
@@ -75,6 +76,128 @@ except Exception as e:
 print("=" * 50)
 print("模型加载完成，服务就绪！")
 print("=" * 50)
+
+
+# ==================== MQ 消费者（后台线程） ====================
+
+def start_mq_consumer():
+    """后台线程：监听 RabbitMQ 视频推理任务，崩了自动重启"""
+    import pika, time as _time
+
+    MQ_HOST = "dog-01.lmq.cloudamqp.com"
+    MQ_PORT = 5672
+    MQ_USER = "pusvskws"; MQ_PASS = "r-2Rb9_m8n0nt-nrW6DYDwufRCN2AC1r"
+    MQ_VHOST = "pusvskws"
+    TASK_QUEUE = "lpr.tasks"; RESULT_QUEUE = "lpr.results"
+
+    def consumer_loop():
+        while True:
+            try:
+                params = pika.ConnectionParameters(
+                    host=MQ_HOST, port=MQ_PORT, virtual_host=MQ_VHOST,
+                    credentials=pika.PlainCredentials(MQ_USER, MQ_PASS),
+                    heartbeat=600, blocked_connection_timeout=300)
+                conn = pika.BlockingConnection(params)
+                ch = conn.channel()
+                ch.queue_declare(queue=TASK_QUEUE, durable=True)
+                ch.queue_declare(queue=RESULT_QUEUE, durable=True)
+                ch.basic_qos(prefetch_count=1)
+                ch.basic_consume(queue=TASK_QUEUE, on_message_callback=on_task)
+                print("[MQ] 视频推理消费者已启动")
+                ch.start_consuming()
+                break  # 正常退出
+            except Exception as e:
+                print(f"[MQ] 连接断开/异常: {e}, 5秒后重连...")
+                _time.sleep(5)
+
+    def on_task(ch, method, properties, body):
+        task = json.loads(body)
+        task_id = task["taskId"]
+        minio_obj = task["minioObject"]
+        ocr = task.get("ocr", "lprnet")
+        frame_interval = task.get("frameInterval", 1)
+        print(f"\n[MQ] 收到任务: {task_id}")
+
+        try:
+            # 下载 → 推理 → ffmpeg → 上传 MinIO
+            local_path = os.path.join(UPLOAD_DIR, f"{task_id}.mp4")
+            minio_client.fget_object(MINIO_BUCKET, minio_obj, local_path)
+
+            cap = cv2.VideoCapture(local_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            temp_video = os.path.join(UPLOAD_DIR, f"{task_id}_temp.mp4")
+            writer = cv2.VideoWriter(temp_video, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+
+            results, last_boxes, last_plates = [], [], []
+            frame_idx = 0
+            import time
+            t_start = time.time()
+            while True:
+                ret, frame = cap.read()
+                if not ret: break
+                fr = {"frame": frame_idx, "plates": [], "boxes": []}
+                if frame_idx % frame_interval == 0:
+                    boxes, crops, _ = detect_plates_with_fallback(frame, run_fallback=True)
+                    if len(boxes) > 0:
+                        plates = ocr_recognize(crops, ocr)
+                        fr["plates"] = plates
+                        fr["boxes"] = boxes.tolist() if hasattr(boxes, 'tolist') else list(boxes)
+                        last_boxes, last_plates = fr["boxes"], plates
+                        frame = engine._draw_on_frame(frame, boxes, plates)
+                elif last_boxes:
+                    fr["plates"] = last_plates; fr["boxes"] = last_boxes
+                    frame = engine._draw_on_frame(frame,
+                        np.array([list(map(float, b)) for b in last_boxes]), last_plates)
+                results.append(fr); writer.write(frame); frame_idx += 1
+            cap.release(); writer.release()
+            print(f"[MQ] 推理完成: {task_id} {time.time()-t_start:.1f}s")
+
+            # ffmpeg
+            annotated_name = f"{task_id}_annotated.mp4"
+            annotated_path = os.path.join(UPLOAD_DIR, annotated_name)
+            ffmpeg = "ffmpeg"
+            for p in [r"C:/Users/张开兴/AppData/Local/Microsoft/WinGet/Links/ffmpeg.exe",
+                      r"D:/Free Download Manager/ffmpeg.exe"]:
+                if os.path.exists(p): ffmpeg = p; break
+            import subprocess as sp
+            sp.run([ffmpeg, '-y', '-i', temp_video, '-i', local_path,
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                    '-c:a', 'aac', '-map', '0:v', '-map', '1:a', '-shortest',
+                    annotated_path], capture_output=True)
+
+            # 上传 MinIO
+            minio_video_obj = f"videos/{annotated_name}"
+            minio_client.fput_object(MINIO_BUCKET, minio_video_obj, annotated_path)
+            annotated_url = minio_client.presigned_get_object(MINIO_BUCKET, minio_video_obj)
+
+            # 返回结果（MQ 只传状态+URL，详细数据存 DB）
+            result = {"taskId": task_id, "status": "SUCCESS",
+                      "annotatedVideoUrl": annotated_url,
+                      "fps": fps, "totalFrames": total}
+            ch.basic_publish(exchange='', routing_key=RESULT_QUEUE,
+                             body=json.dumps(result, default=str),
+                             properties=pika.BasicProperties(delivery_mode=2))
+            print(f"[MQ] 结果已发送: {task_id}")
+            ch.basic_ack(delivery_tag=method.delivery_tag)  # 成功才确认
+
+            for f in [local_path, temp_video, annotated_path]:
+                try: os.remove(f)
+                except: pass
+
+        except Exception as e:
+            traceback.print_exc()
+            err = {"taskId": task_id, "status": "FAILED", "error": str(e)}
+            ch.basic_publish(exchange='', routing_key=RESULT_QUEUE,
+                             body=json.dumps(err),
+                             properties=pika.BasicProperties(delivery_mode=2))
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)  # 失败不重回队列，避免死循环
+
+    consumer_loop()
+
+threading.Thread(target=start_mq_consumer, daemon=True).start()
 
 
 # ==================== OCR 引擎切换 ====================

@@ -44,6 +44,9 @@ public class RecognitionTask {
     /** 创建时间 */
     private LocalDateTime createTime;
 
+    /** 处理心跳（py 存活标志） */
+    private LocalDateTime lastHeartbeat;
+
     /** 完成时间 */
     private LocalDateTime completeTime;
 }

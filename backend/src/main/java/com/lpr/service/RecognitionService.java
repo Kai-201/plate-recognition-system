@@ -60,6 +60,9 @@ public class RecognitionService {
     private com.lpr.config.SseService sseService;
 
     @Resource
+    private MqService mqService;
+
+    @Resource
     private MinioService minioService;
 
     @org.springframework.context.annotation.Lazy
@@ -424,59 +427,22 @@ public class RecognitionService {
             task.setStatus("PROCESSING");
             taskMapper.updateById(task);
 
-            // Python 直接从 MinIO 下载原始视频
-            long pyStart = System.currentTimeMillis();
-            JsonNode response = pythonClient.inferenceVideoByMinio(task.getFilePath(), 1, ocr);
-            long pyEnd = System.currentTimeMillis();
-            log.info("[耗时] Python推理+合成: {}ms", pyEnd - pyStart);
-            JsonNode data = response.get("data");
-
-            // 只存摘要，不存全量帧数据
-            java.util.Map<String, Object> summary = new HashMap<>();
-            summary.put("fps", data.has("fps") ? data.get("fps").asDouble() : 0);
-            summary.put("total_frames", data.has("total_frames") ? data.get("total_frames").asInt() : 0);
-            if (data.has("annotated_video_url") && !data.get("annotated_video_url").isNull())
-                summary.put("annotated_video_url", data.get("annotated_video_url").asText());
-            if (data.has("video_url") && !data.get("video_url").isNull())
-                summary.put("video_url", data.get("video_url").asText());
-            // 只保留有车牌的关键帧
-            JsonNode results = data.get("results");
-            if (results != null && results.isArray()) {
-                java.util.List<Map<String, Object>> keyframes = new java.util.ArrayList<>();
-                for (JsonNode fr : results) {
-                    if (fr.has("plates") && fr.get("plates").size() > 0) {
-                        Map<String, Object> kf = new HashMap<>();
-                        kf.put("frame", fr.get("frame").asInt());
-                        kf.put("plates", fr.get("plates").toString());
-                        keyframes.add(kf);
-                    }
-                }
-                summary.put("plates_detected", keyframes.size());
-                summary.put("keyframes", keyframes);
-            }
-            task.setPlatesJson(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(summary));
-
-            task.setStatus("SUCCESS");
-            task.setCompleteTime(LocalDateTime.now());
-            taskMapper.updateById(task);
-
-            RecognitionResultVO vo = toVO(task);
-            sseService.push(task.getTaskId(), vo);
-            log.info("SSE已推送: taskId={}", task.getTaskId());
-            long totalTime = java.time.Duration.between(task.getCreateTime(), LocalDateTime.now()).toMillis();
-            log.info("[总耗时] 视频上传到结果就绪: {}ms ({}s)", totalTime, totalTime / 1000);
-            log.info("视频识别完成: taskId={}, platesJson已存储", task.getTaskId());
+            // MQ 发送任务给 Python（HTTP→MQ解耦）
+            Map<String, Object> mqTask = new HashMap<>();
+            mqTask.put("taskId", task.getTaskId());
+            mqTask.put("minioObject", task.getFilePath());
+            mqTask.put("ocr", ocr);
+            mqTask.put("frameInterval", 1);
+            mqService.sendTask(mqTask);
+            log.info("MQ 已发送: taskId={}", task.getTaskId());
+            // Python 处理完 → MqResultReceiver 接收 → 更新DB + SSE推送
 
         } catch (Exception e) {
-            log.error("视频识别失败: taskId={}", task.getTaskId(), e);
+            log.error("MQ 发送失败: taskId={}", task.getTaskId(), e);
             task.setStatus("FAILED");
             task.setErrorMsg(e.getMessage());
             task.setCompleteTime(LocalDateTime.now());
             taskMapper.updateById(task);
-            Map<String, Object> errResult = new HashMap<>();
-            errResult.put("status", "FAILED");
-            errResult.put("error", e.getMessage());
-            wsHandler.pushResult(task.getTaskId(), errResult);
         }
     }
 
@@ -515,7 +481,7 @@ public class RecognitionService {
         wsHandler.pushResult(task.getTaskId(), vo);
     }
 
-    private RecognitionResultVO toVO(RecognitionTask task) {
+    public RecognitionResultVO toVO(RecognitionTask task) {
         RecognitionResultVO vo = RecognitionResultVO.builder()
                 .taskId(task.getTaskId())
                 .fileName(task.getFileName())
