@@ -110,17 +110,17 @@ def start_mq_consumer():
                 _time.sleep(5)
 
     def on_task(ch, method, properties, body):
-        # 指数退避重试：5s → 15s → 45s，最多3次
-        headers = properties.headers or {}
-        retry = headers.get('x-retry-count', 0)
-        if method.redelivered and retry >= 3:
+        # MQ x-death 计数：每次重投自动+1（硬崩/异常都计）
+        xd = (properties.headers or {}).get('x-death', [])
+        death_count = xd[0]['count'] if xd else 0
+        if death_count >= 3:
             task_raw = json.loads(body)
             tid = task_raw.get("taskId", "?")
-            err = {"taskId": tid, "status": "FAILED", "error": f"重试{retry}次仍失败"}
+            err = {"taskId": tid, "status": "FAILED", "error": f"重试{death_count}次仍失败"}
             ch.basic_publish(exchange='', routing_key=RESULT_QUEUE,
                              body=json.dumps(err), properties=pika.BasicProperties(delivery_mode=2))
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            print(f"[MQ] FAILED(放弃): {tid}")
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)  # →DLQ
+            print(f"[MQ] ->DLQ: {tid} death={death_count}")
             return
 
         task = json.loads(body)
@@ -131,6 +131,9 @@ def start_mq_consumer():
         frame_interval = task.get("frameInterval", 1)
         print(f"\n[MQ] 收到任务: {task_id} ({task_type})")
 
+        # === 处理阶段（失败才重试） ===
+        process_ok = False
+        result = None
         try:
             ext = minio_obj[minio_obj.rfind('.'):]
             local_path = os.path.join(UPLOAD_DIR, f"{task_id}{ext}")
@@ -184,6 +187,11 @@ def start_mq_consumer():
             while True:
                 ret, frame = cap.read()
                 if not ret: break
+                # 每30帧发心跳保活MQ连接+更新DB
+                if frame_idx % 30 == 0:
+                    try: ch.basic_publish(exchange='', routing_key='lpr.heartbeat',
+                          body=json.dumps({"taskId": task_id}))
+                    except: pass
                 fr = {"frame": frame_idx, "plates": [], "boxes": []}
                 if frame_idx % frame_interval == 0:
                     boxes, crops, _ = detect_plates_with_fallback(frame, run_fallback=True)
@@ -199,7 +207,8 @@ def start_mq_consumer():
                         np.array([list(map(float, b)) for b in last_boxes]), last_plates)
                 results.append(fr); writer.write(frame); frame_idx += 1
             cap.release(); writer.release()
-            print(f"[MQ] 推理完成: {task_id} {time.time()-t_start:.1f}s")
+            t_total = time.time() - t_start
+            print(f"[MQ视频] {task_id} 总{t_total:.1f}s  {total}帧 检测{len([r for r in results if r['boxes']])}帧有牌")
 
             # ffmpeg
             annotated_name = f"{task_id}_annotated.mp4"
@@ -223,6 +232,7 @@ def start_mq_consumer():
             result = {"taskId": task_id, "status": "SUCCESS",
                       "annotatedVideoUrl": annotated_url,
                       "fps": fps, "totalFrames": total}
+            process_ok = True  # 处理成功
             ch.basic_publish(exchange='', routing_key=RESULT_QUEUE,
                              body=json.dumps(result, default=str),
                              properties=pika.BasicProperties(delivery_mode=2))
@@ -235,6 +245,23 @@ def start_mq_consumer():
 
         except Exception as e:
             traceback.print_exc()
+            # 处理失败 → 重试。发结果失败 → 只记日志不重试
+            if process_ok:
+                # 处理成功但发结果失败 → 重试发结果(最大3次)
+                for pub_retry in range(3):
+                    try:
+                        import time as _t3; _t3.sleep(2)
+                        ch.basic_publish(exchange='', routing_key=RESULT_QUEUE,
+                                         body=json.dumps(result, default=str),
+                                         properties=pika.BasicProperties(delivery_mode=2))
+                        ch.basic_ack(delivery_tag=method.delivery_tag)
+                        print(f"[MQ] 发结果重试{pub_retry+1}次后成功: {task_id}")
+                        return
+                    except:
+                        pass
+                print(f"[MQ] 发结果3次全失败: {task_id}")
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                return
             next_retry = retry + 1
             if next_retry <= 3:
                 delays = [5, 15, 45]

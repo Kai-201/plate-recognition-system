@@ -13,9 +13,9 @@ public class MqConfig {
     public static final String TASK_QUEUE = "lpr.tasks";
     public static final String RESULT_QUEUE = "lpr.results";
     public static final String DLX = "lpr.dlx";           // 死信交换机
-    public static final String DLQ = "lpr.tasks.dlq";     // 死信队列
+    public static final String DLQ = "lpr.tasks.dlq";
 
-    /** 死信队列：接收处理失败的消息，用于告警+人工排查 */
+    /** 死信队列 */
     @Bean
     public Queue dlq() { return new Queue(DLQ, true); }
 

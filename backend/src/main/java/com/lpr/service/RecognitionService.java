@@ -11,6 +11,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -73,6 +74,24 @@ public class RecognitionService {
     private String uploadPath;
 
     // ==================== 秒传检查 ====================
+
+    @Scheduled(fixedRate = 300000)
+    public void cleanStaleTasks() {
+        LocalDateTime cutoff = LocalDateTime.now().minusMinutes(5);
+        long c1 = taskMapper.update(null, new LambdaUpdateWrapper<RecognitionTask>()
+                .in(RecognitionTask::getStatus, "PROCESSING")
+                .isNotNull(RecognitionTask::getLastHeartbeat)
+                .lt(RecognitionTask::getLastHeartbeat, LocalDateTime.now().minusMinutes(2))
+                .set(RecognitionTask::getStatus, "FAILED")
+                .set(RecognitionTask::getErrorMsg, "推理超时-心跳停止"));
+        long c2 = taskMapper.update(null, new LambdaUpdateWrapper<RecognitionTask>()
+                .in(RecognitionTask::getStatus, "PROCESSING")
+                .isNull(RecognitionTask::getLastHeartbeat)
+                .lt(RecognitionTask::getCreateTime, cutoff)
+                .set(RecognitionTask::getStatus, "FAILED")
+                .set(RecognitionTask::getErrorMsg, "推理超时-MQ无响应"));
+        if (c1 + c2 > 0) log.info("定时清理: {} 条超时任务", c1 + c2);
+    }
 
     public void updateHash(String taskId, String hash) {
         if (hash == null || hash.isEmpty()) return;
