@@ -10,6 +10,7 @@ backend/target/
 *.jpg
 *.png
 *.txt
+!requirements.txt
 inference/test_*.py
 inference/benchmark.py
 inference/test_ocr_enhance.py
