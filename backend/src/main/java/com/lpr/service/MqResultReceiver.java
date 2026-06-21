@@ -33,6 +33,9 @@ public class MqResultReceiver {
     private SseService sseService;
 
     @Resource
+    private MinioService minioService;
+
+    @Resource
     private com.lpr.service.RecognitionService recognitionService;
 
     @RabbitListener(queues = MqConfig.RESULT_QUEUE)
@@ -46,6 +49,11 @@ public class MqResultReceiver {
                 .eq(RecognitionTask::getTaskId, taskId));
         if (task == null) {
             log.warn("MQ 结果找不到任务: taskId={}", taskId);
+            return;
+        }
+        // 幂等：已处理过→跳过
+        if ("SUCCESS".equals(task.getStatus()) || "FAILED".equals(task.getStatus())) {
+            log.info("[MQ] 幂等跳过(已{}): {}", task.getStatus(), taskId);
             return;
         }
 
@@ -71,6 +79,8 @@ public class MqResultReceiver {
         }
         task.setCompleteTime(LocalDateTime.now());
         taskMapper.updateById(task);
+        // 写 MinIO 状态标记（幂等用）
+        try { minioService.putEmptyObject("status/" + taskId + "/done"); } catch (Exception ignored) {}
 
         RecognitionResultVO vo = recognitionService.toVO(task);
         sseService.push(taskId, vo);

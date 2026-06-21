@@ -119,11 +119,12 @@ def start_mq_consumer():
             err = {"taskId": tid, "status": "FAILED", "error": f"重试{death_count}次仍失败"}
             ch.basic_publish(exchange='', routing_key=RESULT_QUEUE,
                              body=json.dumps(err), properties=pika.BasicProperties(delivery_mode=2))
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)  # →DLQ
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
             print(f"[MQ] ->DLQ: {tid} death={death_count}")
             return
 
         task = json.loads(body)
+        task_id = task["taskId"]
         task_id = task["taskId"]
         minio_obj = task["minioObject"]
         task_type = task.get("type", "video")

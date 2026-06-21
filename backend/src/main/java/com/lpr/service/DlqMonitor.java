@@ -4,6 +4,7 @@ import com.lpr.config.MqConfig;
 import com.lpr.config.SseService;
 import com.lpr.mapper.RecognitionTaskMapper;
 import com.lpr.model.RecognitionTask;
+import com.lpr.service.MinioService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
@@ -25,6 +26,9 @@ public class DlqMonitor {
     private RecognitionTaskMapper taskMapper;
 
     @Resource
+    private MinioService minioService;
+
+    @Resource
     private SseService sseService;
 
     @RabbitListener(queues = MqConfig.DLQ)
@@ -40,6 +44,7 @@ public class DlqMonitor {
             task.setErrorMsg("消息进死信队列(DLQ)");
             task.setCompleteTime(LocalDateTime.now());
             taskMapper.updateById(task);
+            try { minioService.putEmptyObject("status/" + taskId + "/done"); } catch (Exception ignored) {}
             log.info("[DLQ] 已标记FAILED: {}", taskId);
         }
     }

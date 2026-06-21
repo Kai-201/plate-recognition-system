@@ -106,5 +106,13 @@ public class MinioService {
                 .build());
     }
 
+    /** 写空对象（幂等标记用） */
+    public void putEmptyObject(String objectName) {
+        try {
+            client.putObject(PutObjectArgs.builder().bucket(bucket).object(objectName)
+                .stream(new java.io.ByteArrayInputStream(new byte[0]), 0, -1).build());
+        } catch (Exception e) { /* ignore */ }
+    }
+
     public String getBucket() { return bucket; }
 }
