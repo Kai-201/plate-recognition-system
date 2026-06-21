@@ -11,6 +11,13 @@ backend/target/
 **/.idea/
 *.jpg
 *.png
+*.txt
+inference/test_*.py
+inference/benchmark.py
+inference/test_ocr_enhance.py
+inference/298a70a9-90f4-4868-9cb4-4a964297c60d.png
+inference/test*.jpg
+inference/mq_worker.py
 start.bat
 start_minio.bat
 .claude/
