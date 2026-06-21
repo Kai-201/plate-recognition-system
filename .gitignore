@@ -4,8 +4,6 @@ inference/__pycache__/*
 inference/venv/
 **/__pycache__/
 *.pyc
-*.pth
-*.pt
 node_modules/
 backend/target/
 **/.idea/
@@ -22,3 +20,5 @@ start.bat
 start_minio.bat
 .claude/
 *.local.json
+yolov8n.pt
+inference/改版/

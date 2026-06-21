@@ -19,7 +19,7 @@ app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 YOLO_MODEL_PATH = os.path.join(BASE_DIR, "yolo-best.pt")
 LPRNET_MODEL_PATH = os.path.join(BASE_DIR, "lprnet-best_model.pth")
-CRNN_MODEL_PATH = os.path.join(BASE_DIR, "改版", "crnn_best.pth")
+CRNN_MODEL_PATH = os.path.join(BASE_DIR, "ocr_crnn", "crnn_best.pth")
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 ALLOWED_IMAGE = {'.jpg', '.jpeg', '.png', '.bmp', '.gif'}
 ALLOWED_VIDEO = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv'}
@@ -58,8 +58,8 @@ print("[CarDetect] 车辆检测模型加载成功")
 
 # 加载 CRNN（可选，切换 OCR 引擎用）
 try:
-    sys.path.insert(0, os.path.join(BASE_DIR, "改版"))
-    from nets.crnn import CRNN
+    sys.path.insert(0, os.path.join(BASE_DIR, "ocr_crnn"))
+    from crnn import CRNN
     from dataset import CHARS as CRNN_CHARS, LABEL2CHAR
     import torch as crnn_torch
     crnn_device = crnn_torch.device("cuda" if crnn_torch.cuda.is_available() else "cpu")
