@@ -11,3 +11,7 @@ backend/target/
 **/.idea/
 *.jpg
 *.png
+start.bat
+start_minio.bat
+.claude/
+*.local.json
